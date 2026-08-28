@@ -45,13 +45,15 @@ type ChunkSpec struct {
 	SliceEnd      float64
 	SliceDuration float64
 	FilePath      string
+	TargetURL     string
 }
 
 type WorkerResult struct {
-	WorkerID int
-	Elapsed  time.Duration
-	Data     VerboseJSONResponse
-	Err      error
+	WorkerID  int
+	TargetURL string
+	Elapsed   time.Duration
+	Data      VerboseJSONResponse
+	Err       error
 }
 
 func probeDuration(filePath string) (float64, error) {
@@ -99,7 +101,7 @@ func sliceAudioChunk(inputFile string, start, duration float64, outputFile strin
 	return nil
 }
 
-func transcribeChunk(client *http.Client, spec ChunkSpec, serverURL, modelName, language string) (VerboseJSONResponse, error) {
+func transcribeChunk(client *http.Client, spec ChunkSpec, modelName, language string) (VerboseJSONResponse, error) {
 	var respData VerboseJSONResponse
 
 	file, err := os.Open(spec.FilePath)
@@ -135,7 +137,7 @@ func transcribeChunk(client *http.Client, spec ChunkSpec, serverURL, modelName, 
 		return respData, err
 	}
 
-	endpoint := strings.TrimRight(serverURL, "/") + "/v1/audio/transcriptions"
+	endpoint := strings.TrimRight(spec.TargetURL, "/") + "/v1/audio/transcriptions"
 	req, err := http.NewRequest("POST", endpoint, body)
 	if err != nil {
 		return respData, fmt.Errorf("new request error: %w", err)
@@ -185,7 +187,7 @@ func generateSRT(segments []WhisperSegment) string {
 
 func main() {
 	inputFile := flag.String("input", "", "Path to audio file (or pass as first argument)")
-	serverURL := flag.String("url", "http://127.0.0.1:8090", "Whisper server/load balancer URL")
+	serverURL := flag.String("url", "http://127.0.0.1:8090", "Whisper server/load balancer URL (or comma-separated list of worker URLs)")
 	numWorkers := flag.Int("workers", 4, "Number of concurrent parallel workers")
 	overlapSec := flag.Float64("overlap", 1.0, "Overlap window in seconds at chunk boundaries")
 	modelName := flag.String("model", "Systran/faster-whisper-large-v3", "Model name")
@@ -200,7 +202,7 @@ func main() {
 	}
 
 	if targetFile == "" {
-		fmt.Println("Usage: whisper-parallel [flags] <audio_file>")
+		fmt.Println("Usage: whisper-slicing [flags] <audio_file>")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -210,11 +212,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse server URLs (supports comma-separated list or single load-balancer URL)
+	rawURLs := strings.Split(*serverURL, ",")
+	var urls []string
+	for _, u := range rawURLs {
+		trimmed := strings.TrimSpace(u)
+		if trimmed != "" {
+			if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+				trimmed = "http://" + trimmed
+			}
+			urls = append(urls, trimmed)
+		}
+	}
+	if len(urls) == 0 {
+		urls = []string{"http://127.0.0.1:8090"}
+	}
+
 	fmt.Println("=======================================================")
 	fmt.Println("⚡ Go Parallel Whisper Transcription Client")
 	fmt.Println("=======================================================")
 	fmt.Printf("📁 Audio File     : %s\n", targetFile)
-	fmt.Printf("🌐 Server Cluster : %s\n", *serverURL)
+	fmt.Printf("🌐 Endpoints      : %s\n", strings.Join(urls, ", "))
 	fmt.Printf("🚀 Workers        : %d (Goroutines)\n", *numWorkers)
 	fmt.Printf("⏱️  Overlap Window : %.1fs\n", *overlapSec)
 	fmt.Printf("🤖 Model          : %s\n", *modelName)
@@ -257,6 +275,8 @@ func main() {
 			}
 		}
 
+		targetEndpoint := urls[i%len(urls)]
+
 		chunkSpecs[i] = ChunkSpec{
 			ID:            i,
 			NominalStart:  nomStart,
@@ -264,6 +284,7 @@ func main() {
 			SliceStart:    slStart,
 			SliceEnd:      slEnd,
 			SliceDuration: slEnd - slStart,
+			TargetURL:     targetEndpoint,
 		}
 	}
 
@@ -306,23 +327,14 @@ func main() {
 			os.Exit(1)
 		}
 		spec := chunkSpecs[i]
-		fmt.Printf("  Chunk %d: [%.1fs -> %.1fs] (length: %.1fs, nominal: %.1fs - %.1fs)\n",
-			spec.ID, spec.SliceStart, spec.SliceEnd, spec.SliceDuration, spec.NominalStart, spec.NominalEnd)
+		fmt.Printf("  Chunk %d: [%.1fs -> %.1fs] (len: %.1fs, nominal: %.1fs - %.1fs) -> %s\n",
+			spec.ID, spec.SliceStart, spec.SliceEnd, spec.SliceDuration, spec.NominalStart, spec.NominalEnd, spec.TargetURL)
 	}
 	fmt.Printf("✨ All chunks sliced in %v\n\n", time.Since(tSliceStart).Round(time.Millisecond))
 
-	// 4. Concurrent HTTP dispatch to cluster
-	fmt.Printf("🔥 Dispatching %d concurrent HTTP streams to %s...\n", *numWorkers, *serverURL)
+	// 4. Concurrent HTTP dispatch
+	fmt.Printf("🔥 Dispatching %d concurrent HTTP streams...\n", *numWorkers)
 	tTranscribeStart := time.Now()
-
-	httpClient := &http.Client{
-		Timeout: 900 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
 
 	results := make([]WorkerResult, *numWorkers)
 	var transcribeWg sync.WaitGroup
@@ -332,22 +344,35 @@ func main() {
 		go func(idx int) {
 			defer transcribeWg.Done()
 			spec := chunkSpecs[idx]
+
+			// Create dedicated client per worker for clean non-blocking connection isolation
+			workerClient := &http.Client{
+				Timeout: 900 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConns:        10,
+					MaxIdleConnsPerHost: 5,
+					IdleConnTimeout:     90 * time.Second,
+					DisableKeepAlives:   false,
+				},
+			}
+
 			wStart := time.Now()
-			data, err := transcribeChunk(httpClient, spec, *serverURL, *modelName, *language)
+			data, err := transcribeChunk(workerClient, spec, *modelName, *language)
 			wElapsed := time.Since(wStart)
 
 			results[idx] = WorkerResult{
-				WorkerID: spec.ID,
-				Elapsed:  wElapsed,
-				Data:     data,
-				Err:      err,
+				WorkerID:  spec.ID,
+				TargetURL: spec.TargetURL,
+				Elapsed:   wElapsed,
+				Data:      data,
+				Err:       err,
 			}
 
 			if err == nil {
 				speedup := spec.SliceDuration / wElapsed.Seconds()
-				fmt.Printf("  ✅ Worker %d finished in %v (%.1f× realtime)\n", spec.ID, wElapsed.Round(time.Millisecond), speedup)
+				fmt.Printf("  ✅ Worker %d [%s] finished in %v (%.1f× realtime)\n", spec.ID, spec.TargetURL, wElapsed.Round(time.Millisecond), speedup)
 			} else {
-				fmt.Printf("  ❌ Worker %d failed: %v\n", spec.ID, err)
+				fmt.Printf("  ❌ Worker %d [%s] failed: %v\n", spec.ID, spec.TargetURL, err)
 			}
 		}(i)
 	}
@@ -411,7 +436,7 @@ func main() {
 	fmt.Printf("🚀 Effective Cluster Speed: %.1f× realtime\n", realtimeFactor)
 	fmt.Printf("📝 Total Merged Segments  : %d\n", len(mergedSegments))
 	fmt.Printf("🔤 Total Character Count  : %d\n", len(fullText))
-	fmt.Println("=======================================================\n")
+	fmt.Println("=======================================================")
 
 	// 6. Write Outputs
 	prefix := *outputPrefix
