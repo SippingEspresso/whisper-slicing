@@ -1,0 +1,23 @@
+# Binaries
+whisper-slicing
+whisper-parallel
+bin/
+dist/
+
+# Audio / output artifacts
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.aac
+*.txt
+*.srt
+*.json
+
+# OS / Editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
